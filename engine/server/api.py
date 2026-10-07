@@ -1,0 +1,399 @@
+"""HTTP/SSE serving surface over the continuous-batching service.
+
+Status mapping (request-level outcomes never take the worker down):
+    400  prompt tokenizes to nothing, or prompt + max_new_tokens exceeds the model context
+    413  prompt exceeds the configured token limit, or can never fit the KV pool
+    429  submission queue or scheduler queue is full
+    499  client disconnected (no body is sent)
+    503  engine unavailable, draining, or a request was dropped by the pool/shutdown
+    504  per-request deadline exceeded
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import AsyncIterator, Callable
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
+
+
+_DEMO_UI = Path(__file__).with_name("static") / "index.html"
+
+from engine.metrics.prometheus import ServerMetrics
+from engine.runtime import RequestState
+from engine.server.continuous import (
+    ContinuousBatchingService, RequestHandle, ServerShutdown, SubmitError,
+)
+from engine.server.openai import install_openai_routes
+
+
+class GenerateRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    max_new_tokens: int = Field(default=32, ge=1, le=4096)
+
+
+_TERMINAL_STATUS: dict[tuple[str, str | None], int] = {
+    ("REJECTED", "QUEUE_FULL"): 429,
+    ("REJECTED", "KV_CAPACITY_EXCEEDED"): 413,
+    ("FAILED", "KV_POOL_EXHAUSTED"): 503,
+    ("CANCELLED", "TIMEOUT"): 504,
+    ("CANCELLED", "SERVER_SHUTDOWN"): 503,
+    ("CANCELLED", "CLIENT_DISCONNECTED"): 499,
+}
+
+
+def terminal_status(handle: RequestHandle) -> int | None:
+    """HTTP status for a handle, or None when it is in flight or finished normally."""
+    request = handle.request
+    if request.done:
+        if request.state is RequestState.FINISHED:
+            return None
+        key = (request.state.name, request.finish_reason)
+        if key in _TERMINAL_STATUS:
+            return _TERMINAL_STATUS[key]
+        if request.state is RequestState.REJECTED:
+            return 429
+        if request.state is RequestState.CANCELLED:
+            return 499
+        return 500
+    if handle.error is not None:
+        # The worker abandoned the request: shutdown (retry elsewhere) or engine failure.
+        return 503 if isinstance(handle.error, ServerShutdown) else 500
+    return None
+
+
+def default_engine_factory(
+    model_name: str, *, max_active: int, num_blocks: int,
+    block_size: int, dtype: str, decode_attention: str | None,
+    prefill_attention: str | None, graph_buckets: tuple[int, ...],
+    max_pending_requests: int, target_device: str,
+    draft_model_name: str | None, draft_device: str,
+    speculative_ngram: bool, speculation_depth: int,
+):
+    """Load the checkpoint and build the GPU engine. Imported lazily so the API module
+    stays importable (and unit-testable) without CUDA, Triton, or a checkpoint."""
+    from engine.batching.continuous_batching import ContinuousBatchingEngine
+    from engine.model import load_model
+
+    loaded = load_model(model_name, dtype=dtype, device=target_device)
+    proposer = None
+    if draft_model_name is not None:
+        from engine.speculative import DraftModelProposer
+
+        draft = load_model(draft_model_name, dtype=dtype, device=draft_device)
+        if loaded.tokenizer.get_vocab() != draft.tokenizer.get_vocab():
+            raise ValueError("target and draft token maps must be identical")
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            if getattr(loaded.tokenizer, name) != getattr(draft.tokenizer, name):
+                raise ValueError(f"target and draft {name} must be identical")
+        proposer = DraftModelProposer(draft.model, draft.device)
+    buckets = tuple(size for size in graph_buckets if size <= max_active)
+    engine = ContinuousBatchingEngine(
+        loaded.model, loaded.tokenizer, loaded.device, max_active=max_active,
+        num_blocks=num_blocks, block_size=block_size,
+        cuda_graph_batch_sizes=buckets or None,
+        max_waiting_requests=max_pending_requests,
+        speculative_ngram=speculative_ngram,
+        speculative_proposer=proposer,
+        speculation_depth=speculation_depth,
+        **({"decode_attention": decode_attention} if decode_attention else {}),
+        **({"prefill_attention": prefill_attention} if prefill_attention else {}),
+    )
+    # Graph capture and Triton JIT happen at startup, not on the first live requests
+    # that reach each bucket. Readiness is reported only after this returns.
+    engine.warmup()
+    return engine
+
+
+def create_app(
+    model_name: str = "Qwen/Qwen3-0.6B", *, max_active: int = 16,
+    num_blocks: int = 1024, block_size: int = 16, dtype: str = "auto",
+    decode_attention: str | None = None, prefill_attention: str | None = None,
+    graph_buckets: tuple[int, ...] = (2, 4, 8, 16),
+    target_device: str = "cuda:0", draft_model_name: str | None = None,
+    draft_device: str = "cuda:1", speculative_ngram: bool = False,
+    speculation_depth: int = 3,
+    max_pending_requests: int = 256, max_prompt_tokens: int = 4096,
+    request_timeout_s: float = 120.0, drain_timeout_s: float = 30.0,
+    engine_factory: Callable[[], object] | None = None,
+    metrics: ServerMetrics | None = None,
+) -> FastAPI:
+    if min(max_active, num_blocks, block_size, max_pending_requests, max_prompt_tokens,
+           speculation_depth) <= 0:
+        raise ValueError("server capacity limits must be positive")
+    if draft_model_name is not None and speculative_ngram:
+        raise ValueError("use a draft model or n-gram speculation, not both")
+    if draft_model_name is not None and target_device == draft_device:
+        raise ValueError("the Kaggle dual-GPU path requires separate target and draft devices")
+    if request_timeout_s <= 0 or drain_timeout_s < 0:
+        raise ValueError("request_timeout_s must be positive and drain_timeout_s non-negative")
+    service: ContinuousBatchingService | None = None
+    exporter = metrics if metrics is not None else ServerMetrics()
+
+    def build_engine():
+        if engine_factory is not None:
+            return engine_factory()
+        return default_engine_factory(
+            model_name, max_active=max_active, num_blocks=num_blocks,
+            block_size=block_size, dtype=dtype,
+            decode_attention=decode_attention, prefill_attention=prefill_attention,
+            graph_buckets=graph_buckets, max_pending_requests=max_pending_requests,
+            target_device=target_device, draft_model_name=draft_model_name,
+            draft_device=draft_device, speculative_ngram=speculative_ngram,
+            speculation_depth=speculation_depth,
+        )
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        nonlocal service
+        engine = await asyncio.to_thread(build_engine)
+        service = ContinuousBatchingService(
+            engine, max_pending_submissions=max_pending_requests, metrics=exporter,
+        )
+        service.start()
+        try:
+            yield
+        finally:
+            # SIGTERM arrives here via uvicorn's lifespan shutdown: stop admitting,
+            # let in-flight generations finish, cancel stragglers, complete every handle.
+            await asyncio.to_thread(service.stop, drain_timeout_s=drain_timeout_s)
+            service = None
+
+    app = FastAPI(title="full-inference-engine", lifespan=lifespan)
+
+    @app.get("/", include_in_schema=False)
+    async def demo_ui() -> FileResponse:
+        return FileResponse(_DEMO_UI)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics() -> Response:
+        # Scraped while the worker generates; `render` only reads the exporter's own
+        # copies, never live scheduler state.
+        return Response(content=exporter.render(), media_type="text/plain; version=0.0.4")
+
+    def require_service() -> ContinuousBatchingService:
+        if service is None:
+            raise HTTPException(status_code=503, detail="model is not ready")
+        return service
+
+    async def tokenize(current: ContinuousBatchingService, prompt: str) -> list[int]:
+        tokenizer = current.engine.tokenizer
+        # Tokenization is CPU work; keep it off the event loop under load.
+        return await asyncio.to_thread(
+            lambda: tokenizer(prompt, return_tensors="pt").input_ids[0].tolist()
+        )
+
+    async def submit(payload: GenerateRequest) -> tuple[ContinuousBatchingService, RequestHandle]:
+        current = require_service()
+        if not current.ready:
+            raise HTTPException(status_code=503, detail="server is not accepting requests")
+        token_ids = await tokenize(current, payload.prompt)
+        if len(token_ids) > max_prompt_tokens:
+            raise HTTPException(
+                status_code=413,
+                detail=f"prompt exceeds the {max_prompt_tokens}-token server limit",
+            )
+        max_model_len = getattr(current.engine, "max_model_len", None)
+        if max_model_len is not None and len(token_ids) + payload.max_new_tokens > max_model_len:
+            raise HTTPException(
+                status_code=400,
+                detail=f"prompt plus max_new_tokens exceeds the model context of {max_model_len}",
+            )
+        try:
+            return current, current.submit(token_ids, payload.max_new_tokens)
+        except SubmitError as error:
+            raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+
+    async def _await_event(register, timeout_s: float) -> bool:
+        """Await a handle event without occupying an executor thread per request."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+
+        def _fire(_: RequestHandle) -> None:
+            loop.call_soon_threadsafe(lambda: future.done() or future.set_result(None))
+
+        register(_fire)
+        try:
+            await asyncio.wait_for(future, timeout_s)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def wait_for(handle: RequestHandle, timeout_s: float) -> bool:
+        return await _await_event(handle.on_complete, timeout_s)
+
+    async def wait_for_admission(handle: RequestHandle, timeout_s: float) -> bool:
+        return await _await_event(handle.on_accept, timeout_s)
+
+    def metrics(handle: RequestHandle) -> dict[str, float | int | None]:
+        """Per-request timing with queueing, stalls, and recompute cost separated."""
+        request = handle.request
+        report = dict(request.latency_report())
+        report.update(request.recompute_overhead())
+        return report
+
+    def failure_response(handle: RequestHandle) -> JSONResponse | None:
+        status = terminal_status(handle)
+        if status is None:
+            return None
+        detail = handle.request.finish_reason or (
+            str(handle.error) if handle.error is not None else "request failed"
+        )
+        return JSONResponse(
+            status_code=status,
+            content={"error": detail, "request_id": handle.request.request_id},
+            headers={"x-request-id": handle.request.request_id},
+        )
+
+    @app.post("/generate")
+    async def generate(payload: GenerateRequest):
+        service_, handle = await submit(payload)
+        completed = await wait_for(handle, request_timeout_s)
+        if not completed:
+            service_.cancel(handle, reason="TIMEOUT")
+            return JSONResponse(
+                status_code=504,
+                content={"error": "generation deadline exceeded", "request_id": handle.request.request_id},
+                headers={"x-request-id": handle.request.request_id},
+            )
+        failure = failure_response(handle)
+        if failure is not None:
+            return failure
+        tokens = handle.request.output_token_ids
+        return JSONResponse(
+            content={
+                "request_id": handle.request.request_id,
+                "text": service_.engine.tokenizer.decode(tokens, skip_special_tokens=True),
+                "token_ids": tokens, "finish_reason": handle.request.finish_reason,
+                "metrics": metrics(handle),
+            },
+            headers={"x-request-id": handle.request.request_id},
+        )
+
+    @app.get("/health")
+    async def health():
+        """Liveness: the worker is running. A dead worker means restart the process."""
+        current = service
+        if current is None or not current.alive:
+            detail = {"status": "unavailable"}
+            if current is not None:
+                detail.update(current.snapshot())
+                if current.fatal_error is not None:
+                    detail["error"] = str(current.fatal_error)
+            return JSONResponse(status_code=503, content=detail)
+        return {"status": "ok", **current.snapshot()}
+
+    @app.get("/ready")
+    async def ready():
+        """Readiness: accepting requests (loaded, alive, not draining)."""
+        current = service
+        if current is None or not current.ready:
+            content = {"status": "not_ready"}
+            if current is not None:
+                content.update(current.snapshot())
+            return JSONResponse(status_code=503, content=content)
+        return {"status": "ready", **current.snapshot()}
+
+    @app.post("/generate/stream")
+    async def generate_stream(payload: GenerateRequest, request: Request):
+        # Submit and wait for the admission decision before the response starts, so
+        # limit, queue, and capacity errors are real status codes rather than events
+        # inside an already-open stream.
+        service_, handle = await submit(payload)
+        if not await wait_for_admission(handle, request_timeout_s):
+            service_.cancel(handle, reason="TIMEOUT")
+            raise HTTPException(status_code=504, detail="admission deadline exceeded")
+        failure = failure_response(handle)
+        if failure is not None:
+            return failure
+        tokenizer = service_.engine.tokenizer
+
+        async def events() -> AsyncIterator[str]:
+            sent = 0
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            try:
+                while not handle.completed.is_set():
+                    if await request.is_disconnected():
+                        return
+                    if loop.time() - started >= request_timeout_s:
+                        service_.cancel(handle, reason="TIMEOUT")
+                        yield f"data: {json.dumps({'error': 'generation deadline exceeded', 'finish_reason': 'TIMEOUT'})}\n\n"
+                        return
+                    tokens = handle.request.output_token_ids
+                    while sent < len(tokens):
+                        token_id = tokens[sent]
+                        data = {"token_id": token_id,
+                                "text": tokenizer.decode([token_id], skip_special_tokens=True),
+                                "index": sent, "finish_reason": None}
+                        sent += 1
+                        yield f"data: {json.dumps(data)}\n\n"
+                    await asyncio.sleep(0.005)
+                status = terminal_status(handle)
+                if status is not None:
+                    detail = handle.request.finish_reason or str(handle.error)
+                    yield f"data: {json.dumps({'error': detail, 'status': status, 'finish_reason': handle.request.finish_reason})}\n\n"
+                    return
+                tokens = handle.request.output_token_ids
+                while sent < len(tokens):
+                    token_id = tokens[sent]
+                    data = {"token_id": token_id,
+                            "text": tokenizer.decode([token_id], skip_special_tokens=True),
+                            "index": sent, "finish_reason": None}
+                    sent += 1
+                    yield f"data: {json.dumps(data)}\n\n"
+                yield f"data: {json.dumps({'token_id': None, 'text': '', 'index': None, 'finish_reason': handle.request.finish_reason})}\n\n"
+            finally:
+                # Starlette cancels the generator when a socket disappears, which may
+                # bypass the explicit is_disconnected branch. Always reclaim unfinished
+                # scheduler/KV state through the worker-owned cancellation queue.
+                if not handle.completed.is_set():
+                    service_.cancel(handle)
+
+        return StreamingResponse(
+            events(), media_type="text/event-stream",
+            headers={"x-request-id": handle.request.request_id},
+        )
+
+    # The OpenAI-compatible surface shares this app's service, limits and timeouts; it
+    # is a translation layer over the same submissions the native routes make.
+    install_openai_routes(
+        app, require_service=require_service, model_name=model_name,
+        max_prompt_tokens=max_prompt_tokens, request_timeout_s=request_timeout_s,
+    )
+    return app
+
+
+def create_rtx4060_flash_app() -> FastAPI:
+    """Measured long-context profile for the 8 GB RTX 4060 and Qwen3-0.6B.
+
+    Use with ``uvicorn engine.server.api:create_rtx4060_flash_app --factory``.
+    The 256-token pages are required by FA2 paged KV; decode deliberately stays on the
+    graph-safe Triton backend.
+    """
+    return create_app(
+        model_name="Qwen/Qwen3-0.6B", dtype="float16",
+        max_active=8, num_blocks=64, block_size=256,
+        decode_attention="per_head", prefill_attention="flash",
+        graph_buckets=(1, 2, 4, 8),
+    )
+
+
+def create_kaggle_t4x2_speculative_app() -> FastAPI:
+    """Qwen3-4B target on T4:0 with a Qwen3-0.6B draft on T4:1.
+
+    Use with ``uvicorn engine.server.api:create_kaggle_t4x2_speculative_app --factory``.
+    This profile is deliberately explicit: it must never place both checkpoints on the
+    same card or silently substitute the 1.7B challenger selected by a different run.
+    """
+    return create_app(
+        model_name="Qwen/Qwen3-4B", dtype="float16", target_device="cuda:0",
+        draft_model_name="Qwen/Qwen3-0.6B", draft_device="cuda:1",
+        speculation_depth=3, max_active=4, num_blocks=512, block_size=16,
+        graph_buckets=(1, 2, 4),
+    )

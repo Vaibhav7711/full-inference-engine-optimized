@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.coverage
+build/
+dist/
+
+# macOS clutter
+.DS_Store
+**/.DS_Store
+
+*.trace
+*.prof
+*.nsys-rep
+
+# local archives
+*.zip
