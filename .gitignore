@@ -19,3 +19,9 @@ dist/
 
 # local archives
 *.zip
+
+# Downloaded checkpoints and local measurement output are not part of this runtime repo.
+models/
+results/
+*.safetensors
+*.ncu-rep
